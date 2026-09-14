@@ -1,0 +1,15 @@
+fastapi==0.122.0
+runpod
+sherpa-onnx>=1.12.26
+uvicorn
+python-multipart
+torch
+torchaudio
+huggingface_hub
+pyannote.audio
+soundfile
+numpy
+scipy
+pydub==0.25.1
+huggingface-hub==0.36.0
+transformers
