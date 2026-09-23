@@ -1,79 +1,34 @@
-# ai_engine.py (BẢN FINAL - ZIPFORMER + PYANNOTE)
-# uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# ai_engine.py (BẢN v3 — DIARIZE + ZIPFORMER)
 import os
-import torch # Import torch đầu tiên
-from huggingface_hub import login
-import pyannote.audio.core.task
+import torch
+import multiprocessing
 
 # ==============================================================================
-# [CRITICAL FIX] VÁ LỖI TORCH 2.6+ VỚI PYANNOTE
+# [PERF] Tối ưu CPU threading
 # ==============================================================================
-try:
-    torch.serialization.add_safe_globals([
-        pyannote.audio.core.task.Specifications,
-        pyannote.audio.core.task.Problem,
-        pyannote.audio.core.task.Resolution, # Thêm dự phòng
-    ])
-    print("✅ AI Engine: Đã whitelist các class của Pyannote")
-except Exception as e:
-    print(f"⚠️ Whitelist Error: {e}")
-
-_original_load = torch.load
-
-def _unsafe_load(*args, **kwargs):
-    if 'weights_only' not in kwargs:
-        kwargs['weights_only'] = False
-    return _original_load(*args, **kwargs)
-
-torch.load = _unsafe_load
-print("✅ Đã áp dụng bản vá: torch.load(weights_only=False)")
+_NUM_THREADS = min(8, multiprocessing.cpu_count())
+torch.set_num_threads(_NUM_THREADS)
+print(f"✅ CPU threads: {_NUM_THREADS} (cores: {multiprocessing.cpu_count()})")
 # ==============================================================================
 
 os.environ["HF_HOME"] = "/workspace/cache"
 
 import gc
+import concurrent.futures
 import soundfile as sf
 import numpy as np
 import sherpa_onnx
 import urllib.request
 import tarfile
 import shutil
-import urllib.request
-import tarfile
-import shutil
 import glob
 import json
-from pyannote.audio import Pipeline
-from pyannote.core import Annotation
+from diarize import diarize as diarize_fn
 from torchaudio.functional import resample
 
 # ==========================================
-# CẤU HÌNH HUB & MODEL
+# CẤU HÌNH MODEL
 # ==========================================
-DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
-
-
-def _setup_hf_auth():
-    """
-    Verify HF_TOKEN + login HuggingFace.
-    Gọi hàm này ở runtime (MeetingAssistant.__init__), KHÔNG gọi ở module load
-    để builder.py có thể import module mà không cần token.
-    """
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        raise RuntimeError(
-            "❌ HF_TOKEN chưa được set.\n"
-            "  - Local dev: tạo file .env và đặt HF_TOKEN=<token> (xem .env.example).\n"
-            "  - RunPod: vào Console → Endpoint → Environment Variables → thêm HF_TOKEN=<token>.\n"
-            "  - Lấy token tại https://huggingface.co/settings/tokens (cần accept terms của "
-            "pyannote/speaker-diarization-community-1)."
-        )
-    try:
-        login(token=hf_token)
-        print("✅ Đã đăng nhập HuggingFace thành công!")
-    except Exception as e:
-        print(f"⚠️ Lỗi đăng nhập HuggingFace: {e}")
-    return hf_token
 
 # ==========================================
 # FIX LỖI TƯƠNG THÍCH (NUMPY & TORCHAUDIO)
@@ -200,18 +155,8 @@ class MeetingAssistant:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🚀 Init: Device={self.device.upper()}")
 
-        # --- HF AUTH (chỉ fail khi runtime, không fail khi build) ---
-        _setup_hf_auth()
-
-        # --- LOAD PYANNOTE (DIARIZATION) ---
-        print("⏳ [INIT] Đang load Pyannote (Speaker Diarization)...")
-        try:
-            self.pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL)
-            self.pipeline.to(torch.device(self.device))
-            print("✅ [INIT] Pyannote CUDA OK.")
-        except Exception as e:
-            print(f"❌ [INIT ERROR] Pyannote: {e}")
-            self.pipeline = None
+        # --- DIARIZATION (diarize library — ONNX, no HF key needed) ---
+        print("✅ [INIT] Diarize library ready (ONNX, CPU-optimized)")
 
         # VAD config (shared between vi and en recognizers)
         vad_model_dir = "./model_vi"  # VAD onnx lives in model_vi
@@ -239,7 +184,7 @@ class MeetingAssistant:
                 encoder=encoder,
                 decoder=decoder,
                 joiner=joiner,
-                num_threads=4,
+                num_threads=min(8, multiprocessing.cpu_count()),
                 sample_rate=16000,
                 feature_dim=80,
                 decoding_method="modified_beam_search",
@@ -266,7 +211,7 @@ class MeetingAssistant:
                 encoder=encoder_en,
                 decoder=decoder_en,
                 joiner=joiner_en,
-                num_threads=4,
+                num_threads=min(8, multiprocessing.cpu_count()),
                 sample_rate=16000,
                 feature_dim=80,
                 decoding_method="modified_beam_search",
@@ -322,18 +267,6 @@ class MeetingAssistant:
         
         return audio, sr
 
-    def _to_annotation(self, obj) -> Annotation:
-        if isinstance(obj, Annotation): return obj
-        ann = getattr(obj, "speaker_diarization", None)
-        if isinstance(ann, Annotation): return ann
-        ann = getattr(obj, "annotation", None)
-        if isinstance(ann, Annotation): return ann
-        if isinstance(obj, dict):
-            for key in ("speaker_diarization", "annotation", "content"):
-                ann = obj.get(key)
-                if isinstance(ann, Annotation): return ann
-        return None
-
     def _post_process_diarization(self, segments):
         if not segments: return []
         
@@ -376,7 +309,7 @@ class MeetingAssistant:
             
         return refined
 
-    # 1. Pipeline: Audio -> Transcript (Zipformer + Pyannote)
+    # 1. Pipeline: Audio -> Transcript (Zipformer + Pyannote) — PARALLEL
     def process_audio_to_transcript(self, audio_path: str, language: str = "vi"):
         print(f"🎤 [1/3] Start Operation...")
 
@@ -388,291 +321,181 @@ class MeetingAssistant:
         else:
             recognizer = self.recognizer_vi
 
-        if self.pipeline is None or recognizer is None:
+        if recognizer is None:
             return {"error": "Model chưa khởi tạo."}
 
         # Load Audio (Tensor 16k) - Robust Norm ON
         waveform_tensor, sr = self._load_wav16k_mono(audio_path, normalize=True)
-        
-        # --- BƯỚC 1: DIARIZATION (Tách người nói) ---
-        print("   ⏳ Running Diarization...")
-        try:
-            diarization = self.pipeline({"waveform": waveform_tensor, "sample_rate": sr})
-            print("   ✅ Diarization DONE!")
-        except Exception as e:
-            print(f"❌ Diarization Failed: {e}")
-            return {"error": str(e)}
-
-        ann = self._to_annotation(diarization)
-        diar_segs = [{"start": t.start, "end": t.end, "speaker": s} for t, _, s in ann.itertracks(yield_label=True)] if ann else []
-        
-        # [IMPROVEMENT] Smooth Diarization (Fix A -> B(short) -> A)
-        diar_segs = self._post_process_diarization(diar_segs)
-        
-        # --- BƯỚC 2: ZIPFORMER ASR ---
-        print(f"   ⏳ Running Zipformer ASR...")
 
         # Normalize Audio for ASR (Zipformer prefers normalized audio)
-        print("   🔊 Normalizing Audio for ASR...")
         max_val = torch.max(torch.abs(waveform_tensor))
         if max_val > 0:
             waveform_tensor = waveform_tensor / max_val * 0.9
-        
+
         # Convert Tensor -> Numpy Array (1D) for Sherpa
         audio_samples = waveform_tensor.squeeze().numpy()
-        
-        # Use VAD for segmentation (Crucial for Memory & Accuracy on long files)
-        # [REFACTOR] Handle Long Files by streaming into VAD
-        self.vad.reset()
-        
-        speech_segments = []
-        chunk_size = 30 * 16000 # Feed 30s at a time to avoid overflow
         total_len = len(audio_samples)
-        
-        for start in range(0, total_len, chunk_size):
-            end = min(start + chunk_size, total_len)
-            chunk = audio_samples[start:end]
-            
-            self.vad.accept_waveform(chunk)
-            
-            # Pop available segments immediately
+
+        # ======================================================================
+        # [PERF] PARALLEL: Run Diarization + VAD+ASR simultaneously
+        # Diarization (Pyannote) and ASR (Sherpa) are completely independent.
+        # ======================================================================
+        print("   ⏳ Running Diarization + ASR in PARALLEL...")
+
+        def _run_diarization():
+            print("   📢 Diarization thread started")
+            # Save audio to temp file for diarize (it needs a file path)
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                sf.write(tmp.name, audio_samples, 16000)
+                tmp_path = tmp.name
+            try:
+                result = diarize_fn(tmp_path)
+                diar_segs = [{"start": seg.start, "end": seg.end, "speaker": seg.speaker}
+                             for seg in result.segments]
+                diar_segs = self._post_process_diarization(diar_segs)
+                print(f"   ✅ Diarization DONE! {result.num_speakers} speakers, {len(diar_segs)} segments")
+                return diar_segs
+            finally:
+                os.remove(tmp_path)
+
+        def _run_vad_asr():
+            print("   📢 VAD+ASR thread started")
+            # VAD
+            self.vad.reset()
+            speech_segments = []
+            chunk_size = 30 * 16000
+
+            for start in range(0, total_len, chunk_size):
+                end = min(start + chunk_size, total_len)
+                chunk = audio_samples[start:end]
+                self.vad.accept_waveform(chunk)
+                while not self.vad.empty():
+                    seg = self.vad.pop()
+                    speech_segments.append(seg)
+
             while not self.vad.empty():
-                seg = self.vad.pop()
-                # Adjust time because we are feeding incrementally?
-                # NO. Sherpa VAD tracks internal global time based on inserted samples.
-                # So seg.start IS global time.
-                speech_segments.append(seg)
-        
-        # Flush remaining
-        while not self.vad.empty():
-            speech_segments.append(self.vad.pop())
+                speech_segments.append(self.vad.pop())
 
-        # [FIX] Filter out None segments just in case
-        speech_segments = [s for s in speech_segments if s is not None]
+            speech_segments = [s for s in speech_segments if s is not None]
 
-        # Calculate Speech Coverage
-        total_speech_samples = sum(len(s.samples) for s in speech_segments)
-        coverage_ratio = total_speech_samples / len(audio_samples) if len(audio_samples) > 0 else 0
+            total_speech_samples = sum(len(s.samples) for s in speech_segments)
+            coverage_ratio = total_speech_samples / total_len if total_len > 0 else 0
+            print(f"   ℹ️ VAD: {len(speech_segments)} segments, coverage: {coverage_ratio*100:.1f}%")
 
-        print(f"   ℹ️ VAD detected {len(speech_segments)} segments. Coverage: {coverage_ratio*100:.2f}%")
-        
-        # [FALLBACK] If VAD returns 0 segments OR coverage is suspiciously low (< 5%) for long files
-        # This fixes case: VAD found 2 blips in 10 mins file -> Result was empty.
-        is_sparse = (len(audio_samples) > 16000*30) and (coverage_ratio < 0.05)
-        
-        if len(speech_segments) == 0 or is_sparse:
-             print("⚠️ VAD Coverage too low. Switching to FORCE CHUNKING (30s)...")
-             # Clear sparse segments to avoid duplicates/overlap confusion
-             speech_segments = [] 
-             
-             sample_rate = 16000
-             chunk_duration = 30 * sample_rate
-             
-             for start_idx in range(0, total_len, chunk_duration):
-                 class FakeSegment:
-                     pass
-                 seg = FakeSegment()
-                 seg.start = start_idx / sample_rate
-                 end_idx = min(start_idx + chunk_duration, total_len)
-                 seg.samples = audio_samples[start_idx:end_idx]
-                 speech_segments.append(seg)
-        
-        # [FIX] Filter out None segments just in case
-        speech_segments = [s for s in speech_segments if s is not None]
-        
-        final_words_stream = []
-        
-        for i, segment in enumerate(speech_segments):
-            if segment is None: continue # Double check
-            
-            # [IMPROVEMENT] Add Padding to Avoid Cutting Off Words
-            # Sherpa VAD segment is strict. We should padd 0.2s left/right if possible.
-            pad_sec = 0.2
-            sr = 16000
-            
-            seg_start_time = max(0, segment.start - pad_sec)
-            # Length of current samples
-            current_len = len(segment.samples)
-            
-            # Since segment.samples is just a copy, we might need access to original FULL audio to pad correctly.
-            # BUT segment.samples is extracted from stream. 
-            # Re-extracting from audio_samples using global time is safer.
-            
-            start_idx = int(seg_start_time * sr)
-            # Duration of segment usually matches len(segment.samples) / sr
-            # But we want to extend end too.
-            original_duration = len(segment.samples) / sr
-            seg_end_time = min(total_len/sr, segment.start + original_duration + pad_sec)
-            end_idx = int(seg_end_time * sr)
-            
-            files_samples_extended = audio_samples[start_idx:end_idx]
-            
-            stream = recognizer.create_stream()
-            stream.accept_waveform(16000, files_samples_extended)
-            recognizer.decode_stream(stream)
-            
-            result = stream.result
-            
-            if not hasattr(result, 'tokens') or not hasattr(result, 'timestamps'):
-                 continue
+            is_sparse = (total_len > 16000*30) and (coverage_ratio < 0.05)
+            if len(speech_segments) == 0 or is_sparse:
+                print("   ⚠️ VAD sparse → FORCE CHUNKING 30s")
+                speech_segments = []
+                chunk_duration = 30 * 16000
+                for start_idx in range(0, total_len, chunk_duration):
+                    class FakeSegment: pass
+                    seg = FakeSegment()
+                    seg.start = start_idx / 16000
+                    end_idx = min(start_idx + chunk_duration, total_len)
+                    seg.samples = audio_samples[start_idx:end_idx]
+                    speech_segments.append(seg)
 
-            raw_tokens = result.tokens 
-            raw_times = result.timestamps
-            
-            if language == "en":
-                # ── English BPE token merging ──────────────────────────────
-                # GigaSpeech tokens use U+2581 (▁) as a word-boundary marker.
-                # Any token that starts with ▁ begins a new word; others are
-                # sub-word continuations that get joined to the current word.
-                word_buffer = ""
-                word_start = -1.0
-                word_end = -1.0
+            # ASR
+            print("   📢 ASR decoding started")
+            words = []
+            for i, segment in enumerate(speech_segments):
+                if segment is None: continue
+                pad_sec = 0.2
+                seg_start_time = max(0, segment.start - pad_sec)
+                current_len = len(segment.samples)
+                start_idx = int(seg_start_time * 16000)
+                original_duration = current_len / 16000
+                seg_end_time = min(total_len/16000, segment.start + original_duration + pad_sec)
+                end_idx = int(seg_end_time * 16000)
 
-                for j, token in enumerate(raw_tokens):
-                    t_start = raw_times[j] + seg_start_time
-                    next_t = raw_times[j+1] if j < len(raw_times)-1 else (raw_times[j] + 0.2)
-                    t_end = next_t + seg_start_time
+                files_samples_extended = audio_samples[start_idx:end_idx]
+                stream = recognizer.create_stream()
+                stream.accept_waveform(16000, files_samples_extended)
+                recognizer.decode_stream(stream)
+                result = stream.result
 
-                    # U+2581 lower-one-eighth block = SentencePiece word boundary
-                    has_boundary = token.startswith('\u2581') or token.startswith(' ')
-                    content = token.replace('\u2581', '').replace(' ', '').strip()
-                    if not content:
-                        continue
+                if not hasattr(result, 'tokens') or not hasattr(result, 'timestamps'):
+                    continue
 
-                    if has_boundary:
-                        if word_buffer:
-                            final_words_stream.append({
-                                "word": word_buffer,
-                                "start": word_start,
-                                "end": word_end,
-                                "speaker": "SPEAKER_00",
-                            })
-                        word_buffer = content
-                        word_start = t_start
-                        word_end = t_end
-                    else:
-                        if not word_buffer:
+                raw_tokens = result.tokens
+                raw_times = result.timestamps
+
+                if language == "en":
+                    word_buffer = ""
+                    word_start = -1.0
+                    word_end = -1.0
+                    for j, token in enumerate(raw_tokens):
+                        t_start = raw_times[j] + seg_start_time
+                        next_t = raw_times[j+1] if j < len(raw_times)-1 else (raw_times[j] + 0.2)
+                        t_end = next_t + seg_start_time
+                        has_boundary = token.startswith('\u2581') or token.startswith(' ')
+                        content = token.replace('\u2581', '').replace(' ', '').strip()
+                        if not content: continue
+                        if has_boundary:
+                            if word_buffer:
+                                words.append({"word": word_buffer, "start": word_start, "end": word_end, "speaker": "SPEAKER_00"})
                             word_buffer = content
                             word_start = t_start
                             word_end = t_end
                         else:
-                            word_buffer += content
-                            word_end = t_end
-
-                if word_buffer:
-                    final_words_stream.append({
-                        "word": word_buffer,
-                        "start": word_start,
-                        "end": word_end,
-                        "speaker": "SPEAKER_00",
-                    })
-
-            else:
-                # ── Vietnamese phonotactic token merging (original logic) ──
-                # [IMPROVEMENT] BPE/SentencePiece Merging Strategy
-                # Use buffer to combine tokens: " tr" + "ễ" -> "trễ"
-                word_buffer = ""
-                word_start = -1.0
-                word_end = -1.0
-                
-                for j, token in enumerate(raw_tokens):
-                    # Calculate absolute timestamps
-                    t_start = raw_times[j] + seg_start_time
-                    next_t = raw_times[j+1] if j < len(raw_times)-1 else (raw_times[j] + 0.2)
-                    t_end = next_t + seg_start_time
-                    
-                    # Check for SentencePiece boundary (leading space)
-                    # ' ' is U+2581 (Lower One Eighth Block) commonly used
-                    # Also check literal space just in case
-                    has_boundary_marker = token.startswith(' ') or token.startswith(' ')
-                    
-                    # Cleanup content
-                    content = token.replace(' ', '').replace(' ', '').strip().lower()
-                    
-                    if not content: continue # Skip pure spacing/noise
-
-                    # Heuristic: Vietnamese Phonotactics
-                    # If Buffer is a "valid part" and Next is a "Vowel", they likely don't mix.
-                    
+                            if not word_buffer:
+                                word_buffer = content; word_start = t_start; word_end = t_end
+                            else:
+                                word_buffer += content; word_end = t_end
+                    if word_buffer:
+                        words.append({"word": word_buffer, "start": word_start, "end": word_end, "speaker": "SPEAKER_00"})
+                else:
+                    word_buffer = ""
+                    word_start = -1.0
+                    word_end = -1.0
                     vowels_str = "aăâeêioôơuưyáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ"
-                    
-                    # Helper to check if char is vowel
-                    def is_vowel(c):
-                        return c in vowels_str
-                    
-                    # List of Valid Initial Consonants (should ALWAYS merge with next vowel)
-                    # "ng" -> "nga", "th" -> "thương", "qu" -> "qua", "gi" -> "gia"
-                    initials = {
-                        "b", "c", "d", "đ", "g", "h", "k", "l", "m", "n", "p", "q", "r", "s", "t", "v", "x",
-                        "ch", "gh", "gi", "kh", "ng", "ngh", "nh", "ph", "qu", "th", "tr"
-                    }
-                    
-                    is_vowel_start = is_vowel(content[0]) if content else False
-                    should_split = has_boundary_marker
-                    
-                    if not should_split and word_buffer and is_vowel_start:
-                         # If the buffer is NOT just an initial consonant...
-                         if word_buffer not in initials:
-                             last_char = word_buffer[-1]
-                             
-                             # Rule 1: Buffer ends in Consonant + Next is Vowel -> ALWAYS SPLIT
-                             # Ex: "trường" + "à" -> Split
-                             if not is_vowel(last_char):
-                                 should_split = True
-                             
-                             # Rule 2: Buffer ends in Vowel + Next is Vowel
-                             # Ex: "thì" + "ờ" (Split) vs "sa" + "y" (Merge)
-                             else:
-                                 # Only allow merge if content is a "Dipthong Closer" 
-                                 # (Single unaccented vowel: a, e, i, o, u, y)
-                                 # Ex: "sa"+"y"->OK, "mu"+"a"->OK. 
-                                 # "thì"+"ờ" (Accented) -> Split.
-                                 is_dipthong_closer = (len(content) == 1) and (content in "aeiouy")
-                                 
-                                 if not is_dipthong_closer:
-                                     should_split = True
-
-                    if should_split:
-                        # Flush previous word if exists
-                        if word_buffer:
-                            final_words_stream.append({
-                                "word": word_buffer,
-                                "start": word_start,
-                                "end": word_end,
-                                "speaker": "SPEAKER_00" 
-                            })
-                        
-                        # Start new word
-                        word_buffer = content
-                        word_start = t_start
-                        word_end = t_end
-                    else:
-                        # Append to current word (sub-word unit)
-                        if not word_buffer:
-                            # Edge case: First token in segment might not have space
-                            word_buffer = content
-                            word_start = t_start
-                            word_end = t_end
+                    def is_vowel(c): return c in vowels_str
+                    initials = {"b","c","d","đ","g","h","k","l","m","n","p","q","r","s","t","v","x","ch","gh","gi","kh","ng","ngh","nh","ph","qu","th","tr"}
+                    for j, token in enumerate(raw_tokens):
+                        t_start = raw_times[j] + seg_start_time
+                        next_t = raw_times[j+1] if j < len(raw_times)-1 else (raw_times[j] + 0.2)
+                        t_end = next_t + seg_start_time
+                        has_boundary_marker = token.startswith(' ') or token.startswith(' ')
+                        content = token.replace(' ', '').replace(' ', '').strip().lower()
+                        if not content: continue
+                        is_vowel_start = is_vowel(content[0]) if content else False
+                        should_split = has_boundary_marker
+                        if not should_split and word_buffer and is_vowel_start:
+                            if word_buffer not in initials:
+                                last_char = word_buffer[-1]
+                                if not is_vowel(last_char):
+                                    should_split = True
+                                else:
+                                    is_dipthong_closer = (len(content) == 1) and (content in "aeiouy")
+                                    if not is_dipthong_closer:
+                                        should_split = True
+                        if should_split:
+                            if word_buffer:
+                                words.append({"word": word_buffer, "start": word_start, "end": word_end, "speaker": "SPEAKER_00"})
+                            word_buffer = content; word_start = t_start; word_end = t_end
                         else:
-                            word_buffer += content
-                            word_end = t_end # Extend duration
-                
-                # Flush remaining buffer at end of segment
-                if word_buffer:
-                    final_words_stream.append({
-                        "word": word_buffer,
-                        "start": word_start,
-                        "end": word_end,
-                        "speaker": "SPEAKER_00" 
-                    })
-            
-            # Explicitly free stream memory
-            del stream
-            if i % 10 == 0: self._flush_memory()
+                            if not word_buffer:
+                                word_buffer = content; word_start = t_start; word_end = t_end
+                            else:
+                                word_buffer += content; word_end = t_end
+                    if word_buffer:
+                        words.append({"word": word_buffer, "start": word_start, "end": word_end, "speaker": "SPEAKER_00"})
 
-        print(f"   ✅ Zipformer DONE. Found {len(final_words_stream)} word-tokens.")
-            
-        print(f"   ✅ Zipformer DONE. Found {len(final_words_stream)} word-tokens.")
+                del stream
+                if i % 10 == 0: self._flush_memory()
+
+            print(f"   ✅ ASR DONE: {len(words)} words")
+            return words
+
+        # Run both in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            diar_future = executor.submit(_run_diarization)
+            asr_future = executor.submit(_run_vad_asr)
+
+            diar_segs = diar_future.result()
+            final_words_stream = asr_future.result()
+
         self._flush_memory()
 
         # --- BƯỚC 3: ALIGNMENT (Ghép người nói vào từng từ) ---
